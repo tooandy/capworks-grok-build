@@ -129,6 +129,10 @@ pub enum ContentBlock {
     },
     Thinking {
         thinking: String,
+        /// Anthropic emits this field for extended thinking, while some
+        /// Messages-compatible providers (including MiniMax) omit it on the
+        /// initial empty thinking block.
+        #[serde(default)]
         signature: String,
     },
     /// Encrypted reasoning the model chose to redact: an opaque `data` blob, never plaintext.
@@ -491,6 +495,30 @@ mod tests {
             serde_json::to_value(ContentBlock::RedactedThinking { data: "abc".into() }).unwrap();
         assert_eq!(json["type"], "redacted_thinking");
         assert_eq!(json["data"], "abc");
+    }
+
+    /// Messages-compatible providers may omit Anthropic's encrypted thinking
+    /// signature. Missing metadata must not abort the entire response stream.
+    #[test]
+    fn thinking_content_block_without_signature_parses() {
+        let event: MessageStreamEvent = serde_json::from_str(
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
+        )
+        .expect("thinking content_block_start without signature must deserialize");
+
+        match event {
+            MessageStreamEvent::ContentBlockStart { content_block, .. } => match content_block {
+                ContentBlock::Thinking {
+                    thinking,
+                    signature,
+                } => {
+                    assert!(thinking.is_empty());
+                    assert!(signature.is_empty());
+                }
+                other => panic!("expected Thinking, got {other:?}"),
+            },
+            other => panic!("expected ContentBlockStart, got {other:?}"),
+        }
     }
 
     #[test]
