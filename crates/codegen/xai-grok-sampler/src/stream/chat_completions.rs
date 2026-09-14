@@ -205,12 +205,13 @@ pub fn stream_chat_completions<'a>(
                     let mut name_for_event: Option<String> = None;
                     let mut args_for_event: Option<String> = None;
 
-                    if let Some(id) = tc_delta.id {
+                    // Empty continuation IDs must not erase the call identity.
+                    if let Some(id) = tc_delta.id.filter(|id| !id.is_empty()) {
                         entry.0 = id.clone();
                         id_for_event = Some(id);
                     }
                     if let Some(func) = tc_delta.function {
-                        if let Some(name) = func.name {
+                        if let Some(name) = func.name.filter(|name| !name.is_empty()) {
                             entry.1 = name.clone();
                             name_for_event = Some(name);
                         }
@@ -246,9 +247,13 @@ pub fn stream_chat_completions<'a>(
 
         // ── Build the final response ─────────────────────────────────
         let tool_calls: Vec<ToolCall> = tool_call_acc
-            .into_values()
-            .map(|(id, name, arguments)| ToolCall {
-                id: std::sync::Arc::<str>::from(id),
+            .into_iter()
+            .map(|(index, (id, name, arguments))| ToolCall {
+                id: std::sync::Arc::<str>::from(if id.is_empty() {
+                    format!("call_{request_id}_{index}")
+                } else {
+                    id
+                }),
                 name,
                 arguments: std::sync::Arc::<str>::from(arguments),
             })
@@ -511,17 +516,17 @@ mod tests {
             }],
             tool_call_id: None,
         }]);
-        // Second chunk has only argument fragment.
+        // Some compatible providers send an empty ID with continuation arguments.
         let chunk2 = make_chunk(vec![ChatChunkDelta {
             role: None,
             content: None,
             reasoning_content: None,
             tool_calls: vec![ChunkToolCallDelta {
                 index: 0,
-                id: None,
+                id: Some(String::new()),
                 kind: None,
                 function: Some(ToolCallFunctionDelta {
-                    name: None,
+                    name: Some(String::new()),
                     arguments: Some("1}".into()),
                 }),
             }],
@@ -581,6 +586,42 @@ mod tests {
             }
             other => panic!("expected Completed, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn missing_tool_ids_are_unique_per_request_and_position() {
+        let mut collected_ids = Vec::new();
+        for request in ["request-a", "request-b"] {
+            let chunk = make_chunk(vec![ChatChunkDelta {
+                role: None,
+                content: None,
+                reasoning_content: None,
+                tool_calls: (0..2).map(|index| ChunkToolCallDelta {
+                    index,
+                    id: None,
+                    kind: Some("function".into()),
+                    function: Some(ToolCallFunctionDelta {
+                        name: Some("check".into()),
+                        arguments: Some("{}".into()),
+                    }),
+                }).collect(),
+                tool_call_id: None,
+            }]);
+            let raw = stream::iter(vec![Ok(chunk)]).boxed();
+            let events = collect(stream_chat_completions(raw, None, RequestId::from(request), Duration::from_secs(60))).await;
+            match events.last().unwrap() {
+                SamplingEvent::Completed { response, .. } => {
+                    for call in response.tool_calls() {
+                        assert!(!call.id.is_empty());
+                        assert_eq!(call.name, "check");
+                        assert!(!collected_ids.contains(&call.id.to_string()));
+                        collected_ids.push(call.id.to_string());
+                    }
+                }
+                other => panic!("expected Completed, got {other:?}"),
+            }
+        }
+        assert_eq!(collected_ids.len(), 4);
     }
 
     #[tokio::test]
