@@ -39,6 +39,7 @@ pub struct XaiProtoBuilder {
     pbjson_preserve_proto_field_names: bool,
     pbjson_exclude: Vec<String>,
     honor_debug_redact: bool,
+    btree_map_paths: Vec<String>,
 }
 
 impl XaiProtoBuilder {
@@ -52,12 +53,20 @@ impl XaiProtoBuilder {
         }
     }
 
-    pub fn btree_map<S: AsRef<str>>(self, paths: impl IntoIterator<Item = S>) -> Self {
+    pub fn btree_map<S: AsRef<str>>(mut self, paths: impl IntoIterator<Item = S>) -> Self {
+        // Recorded so the pbjson builder gets them too; otherwise JSON map keys
+        // serialize in HashMap order and generated files are not byte-stable.
+        let paths: Vec<String> = paths.into_iter().map(|s| s.as_ref().to_owned()).collect();
+        self.btree_map_paths.extend(paths.iter().cloned());
         self.map_builder(|b| paths.into_iter().fold(b, |b, path| b.btree_map(path)))
     }
 
     pub fn bytes<S: AsRef<str>>(self, paths: impl IntoIterator<Item = S>) -> Self {
         self.map_builder(|b| paths.into_iter().fold(b, |b, path| b.bytes(path)))
+    }
+
+    pub fn boxed(self, path: impl AsRef<str>) -> Self {
+        self.map_builder(|b| b.boxed(path))
     }
 
     pub fn extern_path(self, proto_path: impl AsRef<str>, rust_path: impl AsRef<str>) -> Self {
@@ -143,10 +152,20 @@ impl XaiProtoBuilder {
 
         // Can only process one input file when using --dependency_out=FILE.
         for proto in protos {
+            // OpenBuddy patch: `/dev/stdout` and `/dev/null` don't exist on
+            // Windows. Use a temp file for the dependency list instead. (On
+            // Unix this behaves identically.)
+            let dep_file = tempfile::NamedTempFile::new()
+                .context("failed to create temp file for protoc dependency_out")?;
+            let dep_path = dep_file.path().to_path_buf();
+            let null_path = if cfg!(windows) { "NUL" } else { "/dev/null" };
             let mut command = Command::new(protoc.unwrap_or(Path::new("protoc")));
             command
-                .arg("--dependency_out=/dev/stdout")
-                .arg("--descriptor_set_out=/dev/null");
+                .arg(format!(
+                    "--dependency_out={}",
+                    dep_path.to_str().context("dep temp path not UTF-8")?
+                ))
+                .arg(format!("--descriptor_set_out={null_path}"));
 
             // Add protoc's well-known types include directory first (if found).
             // This is needed for Bazel sandboxed builds where protoc and its
@@ -172,15 +191,18 @@ impl XaiProtoBuilder {
                 return Err(anyhow::anyhow!("protoc command failed"));
             }
 
-            let output =
-                String::from_utf8(output.stdout).context("protoc command output not UTF-8")?;
+            // OpenBuddy patch: read dependency list from the temp file we
+            // passed via --dependency_out (instead of parsing stdout).
+            let dep_content = fs::read_to_string(&dep_path)
+                .context("failed to read protoc dependency_out temp file")?;
+            // Keep `dep_file` alive until we've read it.
+            drop(output);
 
-            let mut lines = output.lines();
-            let first_line = lines.next().context("protoc command output is empty")?;
-            let prefix = "/dev/null:";
-            let rem = first_line.strip_prefix(prefix).with_context(|| {
-                format!("protoc command output must start with /dev/null: {output:?}")
-            })?;
+            let mut lines = dep_content.lines();
+            let first_line = lines.next().context("protoc dependency file is empty")?;
+            // protoc writes the descriptor_set_out path as a prefix on the
+            // first line. Strip it whether it's /dev/null, NUL, or a path.
+            let rem = first_line.split_once(':').map(|(_, r)| r).unwrap_or(first_line);
             for line in iter::once(rem).chain(lines) {
                 let line = line.trim();
                 let line = line.strip_suffix("\\").unwrap_or(line);
@@ -225,6 +247,7 @@ impl XaiProtoBuilder {
             pbjson_preserve_proto_field_names,
             pbjson_exclude,
             honor_debug_redact,
+            btree_map_paths,
         } = self;
         let mut config = prost_build::Config::new();
         config.enable_type_names();
@@ -322,6 +345,9 @@ impl XaiProtoBuilder {
             if !pbjson_exclude.is_empty() {
                 builder.exclude(pbjson_exclude);
             }
+            if !btree_map_paths.is_empty() {
+                builder.btree_map(&btree_map_paths);
+            }
             builder
                 .build(&["."])
                 .context("Failed to build descriptor set")?;
@@ -345,5 +371,6 @@ pub fn configure() -> XaiProtoBuilder {
         pbjson_exclude: Vec::new(),
         file_descriptor_set_path: None,
         honor_debug_redact: false,
+        btree_map_paths: Vec::new(),
     }
 }
