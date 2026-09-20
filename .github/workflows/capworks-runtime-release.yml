@@ -1,0 +1,334 @@
+name: CapWorks Grok Runtime Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_revision:
+        description: Full 40-character Grok source commit to build
+        required: true
+        default: 39be4736bab13c3326cd88097c4979a6978039cf
+        type: string
+      publish_release:
+        description: Publish/update the GitHub Release after all target smokes pass
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: capworks-grok-runtime-${{ inputs.source_revision }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Resolve pinned runtime
+    runs-on: ubuntu-latest
+    outputs:
+      source_revision: ${{ steps.meta.outputs.source_revision }}
+      short_revision: ${{ steps.meta.outputs.short_revision }}
+      upstream_version: ${{ steps.meta.outputs.upstream_version }}
+      runtime_version: ${{ steps.meta.outputs.runtime_version }}
+      release_tag: ${{ steps.meta.outputs.release_tag }}
+    steps:
+      - name: Validate source revision
+        env:
+          SOURCE_REVISION: ${{ inputs.source_revision }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          revision="$SOURCE_REVISION"
+          if [[ ! "$revision" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "source_revision must be a full 40-character Git commit" >&2
+            exit 2
+          fi
+
+      - name: Checkout pinned source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.source_revision }}
+          fetch-depth: 0
+          path: source
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+
+      - name: Resolve version identity
+        id: meta
+        env:
+          REQUESTED_REVISION: ${{ inputs.source_revision }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          requested="$REQUESTED_REVISION"
+          actual="$(git -C source rev-parse HEAD)"
+          if [[ "${actual,,}" != "${requested,,}" ]]; then
+            echo "checkout mismatch: requested=$requested actual=$actual" >&2
+            exit 3
+          fi
+          upstream_version="$(python - <<'PY'
+          import tomllib
+          with open('source/crates/codegen/xai-grok-pager-bin/Cargo.toml', 'rb') as f:
+              print(tomllib.load(f)['package']['version'])
+          PY
+          )"
+          short_revision="${actual:0:8}"
+          runtime_version="${upstream_version}+capworks.${short_revision}"
+          release_tag="capworks-runtime-${short_revision}"
+          {
+            echo "source_revision=$actual"
+            echo "short_revision=$short_revision"
+            echo "upstream_version=$upstream_version"
+            echo "runtime_version=$runtime_version"
+            echo "release_tag=$release_tag"
+          } >> "$GITHUB_OUTPUT"
+          printf 'source=%s\nversion=%s\ntag=%s\n' "$actual" "$runtime_version" "$release_tag"
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            target: aarch64-apple-darwin
+            exe_suffix: ""
+            cargo_jobs: 2
+          - runner: windows-2022
+            target: x86_64-pc-windows-msvc
+            exe_suffix: .exe
+            cargo_jobs: 4
+    runs-on: ${{ matrix.runner }}
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_BUILD_JOBS: ${{ matrix.cargo_jobs }}
+      # Keep the source tree's release-dist profile unchanged. In particular,
+      # do not override debug/strip settings here: those are part of upstream's
+      # shipping build contract.
+      GROK_VERSION: ${{ needs.prepare.outputs.runtime_version }}
+    steps:
+      - name: Checkout release automation
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          path: automation
+          persist-credentials: false
+
+      - name: Checkout pinned Grok source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.prepare.outputs.source_revision }}
+          fetch-depth: 0
+          path: source
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+
+      - name: Verify pinned checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual="$(git -C source rev-parse HEAD)"
+          test "$actual" = '${{ needs.prepare.outputs.source_revision }}'
+          echo "Building $actual on $(uname -a 2>/dev/null || true)"
+
+      - name: Install hermetic build helper
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo install dotslash --locked
+          dotslash --help >/dev/null
+
+      - name: Install pinned protoc on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $url = 'https://github.com/protocolbuffers/protobuf/releases/download/v29.3/protoc-29.3-win64.zip'
+          $expected = '57ea59e9f551ad8d71ffaa9b5cfbe0ca1f4e720972a1db7ec2d12ab44bff9383'
+          $archive = Join-Path $env:RUNNER_TEMP 'protoc-29.3-win64.zip'
+          $destination = Join-Path $env:RUNNER_TEMP 'protoc-29.3-win64'
+          Invoke-WebRequest -Uri $url -OutFile $archive
+          $actual = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
+          if ($actual -ne $expected) {
+            throw "protoc checksum mismatch: expected=$expected actual=$actual"
+          }
+          if (Test-Path $destination) { Remove-Item -Recurse -Force $destination }
+          Expand-Archive -Path $archive -DestinationPath $destination
+          $protoc = (Resolve-Path (Join-Path $destination 'bin/protoc.exe')).Path
+          & $protoc --version
+          "PROTOC=$protoc" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Install Rust target
+        shell: bash
+        working-directory: source
+        run: |
+          set -euo pipefail
+          rustup show active-toolchain
+          rustup target add '${{ matrix.target }}'
+
+      - name: Build Grok CLI runtime
+        shell: bash
+        working-directory: source
+        run: |
+          set -euo pipefail
+          cargo build \
+            -p xai-grok-pager-bin \
+            --bin xai-grok-pager \
+            --profile release-dist \
+            --features release-dist \
+            --locked \
+            --target '${{ matrix.target }}'
+
+      - name: Package and smoke ACP runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          target='${{ matrix.target }}'
+          suffix='${{ matrix.exe_suffix }}'
+          source_binary="source/target/${target}/release-dist/xai-grok-pager${suffix}"
+          test -f "$source_binary"
+          mkdir -p dist
+          asset="grok-capworks-${{ needs.prepare.outputs.short_revision }}-${target}${suffix}"
+          cp "$source_binary" "dist/$asset"
+          if [[ "$target" != *windows* ]]; then
+            chmod +x "dist/$asset"
+          fi
+          python automation/scripts/capworks_runtime_smoke.py \
+            --binary "dist/$asset" \
+            --expected-version '${{ needs.prepare.outputs.runtime_version }}' \
+            --source-revision '${{ needs.prepare.outputs.source_revision }}'
+          python - "$target" "$asset" <<'PY'
+          import hashlib
+          import json
+          import pathlib
+          import sys
+          import tomllib
+
+          target, filename = sys.argv[1:]
+          path = pathlib.Path('dist') / filename
+          digest = hashlib.sha256(path.read_bytes()).hexdigest()
+          with open('source/crates/codegen/xai-grok-pager-bin/Cargo.toml', 'rb') as handle:
+              upstream = tomllib.load(handle)['package']['version']
+          metadata = {
+              'target': target,
+              'file': filename,
+              'sha256': digest,
+              'size': path.stat().st_size,
+              'source_revision': '${{ needs.prepare.outputs.source_revision }}',
+              'upstream_version': upstream,
+              'runtime_version': '${{ needs.prepare.outputs.runtime_version }}',
+          }
+          pathlib.Path(f'dist/metadata-{target}.json').write_text(
+              json.dumps(metadata, indent=2, sort_keys=True) + '\n', encoding='utf-8'
+          )
+          PY
+
+      - name: Upload verified target artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: grok-runtime-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish pinned runtime release
+    if: ${{ inputs.publish_release }}
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout release automation
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          path: automation
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+
+      - name: Download verified target artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: grok-runtime-*
+          path: dist
+          merge-multiple: true
+
+      - name: Build aggregate manifest and checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          python automation/scripts/capworks_runtime_manifest.py \
+            --dist dist \
+            --source-revision '${{ needs.prepare.outputs.source_revision }}' \
+            --runtime-version '${{ needs.prepare.outputs.runtime_version }}' \
+            --release-tag '${{ needs.prepare.outputs.release_tag }}' \
+            --repository '${{ github.repository }}' \
+            --builder-revision '${{ github.sha }}' \
+            --run-id '${{ github.run_id }}'
+          cat dist/runtime-manifest.json
+          cat dist/SHA256SUMS
+
+      - name: Publish or update GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.release_tag }}
+          SOURCE_REVISION: ${{ needs.prepare.outputs.source_revision }}
+          RUNTIME_VERSION: ${{ needs.prepare.outputs.runtime_version }}
+          BUILDER_REVISION: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          repo='${{ github.repository }}'
+          mapfile -t assets < <(find dist -maxdepth 1 -type f ! -name 'metadata-*.json' -print | sort)
+
+          tag_exists=false
+          if tag_target="$(gh api "repos/$repo/git/ref/tags/$TAG" --jq '.object.type + " " + .object.sha' 2>/dev/null)"; then
+            tag_exists=true
+            read -r tag_type tag_sha <<< "$tag_target"
+            if [[ "$tag_type" != "commit" || "$tag_sha" != "$SOURCE_REVISION" ]]; then
+              echo "refusing to publish $TAG: existing tag is $tag_type $tag_sha, expected commit $SOURCE_REVISION" >&2
+              exit 4
+            fi
+          fi
+
+          if gh release view "$TAG" --repo "$repo" >/dev/null 2>&1; then
+            if [[ "$tag_exists" != true ]]; then
+              echo "release $TAG exists without a resolvable matching tag" >&2
+              exit 5
+            fi
+            gh release upload "$TAG" "${assets[@]}" --repo "$repo" --clobber
+          else
+            notes=$(cat <<EOF
+          CapWorks pinned Grok Runtime.
+
+          - Source revision: \`$SOURCE_REVISION\`
+          - Builder revision: \`$BUILDER_REVISION\`
+          - Runtime version: \`$RUNTIME_VERSION\`
+          - Transport: ACP over stdio
+          - Entrypoint: \`grok --trust --no-auto-update agent --no-leader stdio\`
+          - Validation: each target passed binary identity, ACP initialize, required capability, and session/new smoke tests without a model prompt.
+          EOF
+          )
+            target_args=()
+            if [[ "$tag_exists" != true ]]; then
+              target_args=(--target "$SOURCE_REVISION")
+            fi
+            gh release create "$TAG" "${assets[@]}" \
+              --repo "$repo" \
+              "${target_args[@]}" \
+              --title "CapWorks Grok Runtime $RUNTIME_VERSION" \
+              --notes "$notes"
+          fi
