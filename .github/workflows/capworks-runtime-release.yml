@@ -188,7 +188,7 @@ jobs:
             --locked \
             --target '${{ matrix.target }}'
 
-      - name: Package and smoke ACP runtime
+      - name: Package target artifact
         shell: bash
         run: |
           set -euo pipefail
@@ -202,10 +202,6 @@ jobs:
           if [[ "$target" != *windows* ]]; then
             chmod +x "dist/$asset"
           fi
-          python automation/scripts/capworks_runtime_smoke.py \
-            --binary "dist/$asset" \
-            --expected-version '${{ needs.prepare.outputs.runtime_version }}' \
-            --source-revision '${{ needs.prepare.outputs.source_revision }}'
           python - "$target" "$asset" <<'PY'
           import hashlib
           import json
@@ -231,6 +227,26 @@ jobs:
               json.dumps(metadata, indent=2, sort_keys=True) + '\n', encoding='utf-8'
           )
           PY
+
+      - name: Preserve built target artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: grok-runtime-built-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 2
+
+      - name: Smoke ACP runtime without provider secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          target='${{ matrix.target }}'
+          suffix='${{ matrix.exe_suffix }}'
+          asset="grok-capworks-${{ needs.prepare.outputs.short_revision }}-${target}${suffix}"
+          python automation/scripts/capworks_runtime_smoke.py \
+            --binary "dist/$asset" \
+            --expected-version '${{ needs.prepare.outputs.runtime_version }}' \
+            --source-revision '${{ needs.prepare.outputs.source_revision }}'
 
       - name: Upload verified target artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -319,7 +335,7 @@ jobs:
           - Runtime version: \`$RUNTIME_VERSION\`
           - Transport: ACP over stdio
           - Entrypoint: \`grok --trust --no-auto-update agent --no-leader stdio\`
-          - Validation: each target passed binary identity, ACP initialize, required capability, and session/new smoke tests without a model prompt.
+          - Validation: each target passed binary identity, ACP initialize/required capability checks, and a no-secret session/new probe that reached either session creation or the explicit authentication-required gate. Credentialed session/new is verified separately by CapWorks live integration.
           EOF
           )
             target_args=()

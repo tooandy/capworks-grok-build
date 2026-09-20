@@ -71,9 +71,14 @@ Each target must pass all of the following before it can be released:
 2. the CLI advertises `agent stdio`;
 3. a real external process completes ACP `initialize` with protocol version 1;
 4. required `session/load` and HTTP MCP capabilities are advertised;
-5. a real ACP `session/new` succeeds in an isolated temporary `GROK_HOME` and
-   workspace;
-6. no model prompt or real provider credential is used by the smoke test.
+5. a real ACP `session/new` probe in an isolated temporary `GROK_HOME` and
+   workspace either creates a session or reaches the pinned Runtime's explicit
+   `Authentication required / no auth method id provided` gate;
+6. no model prompt or provider credential is used by the release smoke test.
+
+Credentialed `session/new` is intentionally a separate CapWorks live
+integration gate. Release CI must not require user/provider secrets merely to
+prove that the pinned Runtime binary and ACP lifecycle are structurally valid.
 
 ## Version and release identity
 

@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Smoke-test a CapWorks-pinned Grok runtime binary over real ACP stdio.
 
-The test intentionally stops before prompting a model. It validates the binary
-identity, ACP initialization/capabilities, and creation of a real session in an
-isolated temporary GROK_HOME/workspace.
+The release smoke intentionally runs without provider credentials. It validates
+the binary identity and ACP initialization/capabilities, then proves session/new
+reaches either a real local session or Grok's explicit authentication gate. A
+credentialed session/new belongs to the CapWorks live integration gate, not the
+artifact build/release trust boundary.
 """
 
 from __future__ import annotations
@@ -108,6 +110,74 @@ def wait_for_response(
     )
 
 
+def wait_for_session_new_or_auth_gate(
+    proc: subprocess.Popen[str],
+    messages: queue.Queue[dict[str, Any]],
+    request_id: int,
+    timeout: float,
+    stderr_lines: list[str],
+    stdout_lines: list[str],
+) -> tuple[str, str | None]:
+    """Return (outcome, session_id) for a no-credential session/new probe.
+
+    The pinned runtime currently checks authentication during session/new. In
+    release CI there are deliberately no provider secrets, so an explicit
+    Authentication required error is evidence that the ACP request reached the
+    expected auth boundary. Any other error still fails closed.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            raise RuntimeError(
+                f"runtime exited with {proc.returncode}; stderr={stderr_lines[-20:]}; "
+                f"stdout={stdout_lines[-20:]}"
+            )
+        try:
+            message = messages.get(timeout=min(0.25, max(0.01, deadline - time.monotonic())))
+        except queue.Empty:
+            continue
+        if "__transport_error__" in message:
+            raise RuntimeError(str(message["__transport_error__"]))
+        if message.get("id") == request_id and ("result" in message or "error" in message):
+            if "result" in message:
+                result = message.get("result")
+                if not isinstance(result, dict):
+                    raise RuntimeError(
+                        f"ACP request {request_id} returned non-object result: {result!r}"
+                    )
+                session_id = result.get("sessionId")
+                if not isinstance(session_id, str) or not session_id:
+                    raise RuntimeError(
+                        f"session/new returned invalid sessionId: {session_id!r}"
+                    )
+                return "session_created", session_id
+
+            error = message.get("error")
+            if not isinstance(error, dict):
+                raise RuntimeError(f"ACP request {request_id} returned malformed error: {error!r}")
+            if (
+                error.get("code") == -32000
+                and error.get("message") == "Authentication required"
+                and error.get("data") == "no auth method id provided"
+            ):
+                return "authentication_required", None
+            raise RuntimeError(f"ACP request {request_id} failed: {error}")
+
+        if "method" in message and "id" in message:
+            send(
+                proc,
+                {
+                    "jsonrpc": "2.0",
+                    "id": message["id"],
+                    "error": {"code": -32601, "message": "unsupported in release smoke"},
+                },
+            )
+    raise TimeoutError(
+        f"timed out waiting for ACP response {request_id}; "
+        f"stderr={stderr_lines[-20:]}; stdout={stdout_lines[-20:]}"
+    )
+
+
 def main() -> int:
     args = parse_args()
     binary = args.binary.resolve()
@@ -148,8 +218,9 @@ def main() -> int:
         env = os.environ.copy()
         env["GROK_HOME"] = str(grok_home)
         env.setdefault("RUST_LOG", "warn")
-        # No real provider credential is present. session/new must remain a
-        # local lifecycle operation; the smoke never issues session/prompt.
+        # No real provider credential is present. The release smoke validates
+        # that session/new reaches the explicit auth gate; it never authenticates
+        # or issues session/prompt.
         env.pop("XAI_API_KEY", None)
         env.pop("GROK_CODE_XAI_API_KEY", None)
 
@@ -226,12 +297,9 @@ def main() -> int:
                     },
                 },
             )
-            created = wait_for_response(
+            session_outcome, session_id = wait_for_session_new_or_auth_gate(
                 proc, messages, 2, args.timeout, stderr_lines, stdout_lines
             )
-            session_id = created.get("sessionId")
-            if not isinstance(session_id, str) or not session_id:
-                raise RuntimeError(f"session/new returned invalid sessionId: {session_id!r}")
             print(
                 json.dumps(
                     {
@@ -239,6 +307,7 @@ def main() -> int:
                         "version": args.expected_version,
                         "source_revision": args.source_revision,
                         "protocol_version": initialized["protocolVersion"],
+                        "session_new": session_outcome,
                         "session_id": session_id,
                     },
                     sort_keys=True,
